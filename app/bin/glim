@@ -1,0 +1,1547 @@
+#!/usr/bin/env ruby
+require_relative '../lib/version'
+require_relative '../lib/exception'
+require_relative '../lib/log_and_profile'
+require_relative '../lib/cache'
+require_relative '../lib/commands'
+require_relative '../lib/liquid_ext'
+require 'csv'
+require 'digest'
+require 'enumerator'
+require 'fileutils'
+require 'find'
+require 'json'
+require 'pathname'
+require 'kramdown'
+require 'liquid'
+require 'mercenary'
+
+if File.exists?('Gemfile')
+  begin
+    require 'bundler/setup'
+  rescue LoadError => e
+    $log.warn("Unable to load Bundler but directory contains a Gemfile")
+  end
+end
+
+module Util
+  module_function
+
+  def slugify(input, preserve_case: false)
+    if input
+      res = input.gsub(/[^[:alnum:]]+/, '-').gsub(/\A-|-\z/, '')
+      preserve_case ? res : res.downcase
+    end
+  end
+
+  def parse_date(maybe_a_date)
+    if maybe_a_date.is_a?(Time)
+      maybe_a_date
+    elsif maybe_a_date.is_a?(Date)
+      maybe_a_date.to_time
+    elsif maybe_a_date.is_a?(String)
+      begin
+        Liquid::Utils.to_date(maybe_a_date)
+      rescue => e
+        $log.warn("Failed to parse date ‘#{maybe_a_date}’: #{e}")
+        nil
+      end
+    end
+  end
+
+  def titlecase(input)
+    unless input.nil?
+      words  = /\A\p{^Lower}+\z|\b\p{Upper}\p{^Upper}+?\b/
+      upcase = /^([\W\d]*)(\w[-\w]*)|\b((?!(?:else|from|over|then|when)\b)\w[-\w]{3,}|\w[-\w]*[\W\d]*$)/
+      input.gsub(/[ _-]+/, ' ').gsub(words) { $&.downcase }.gsub(upcase) { $1 ? ($1 + $2[0].upcase + $2[1..-1]) : ($&[0].upcase + $&[1..-1]) }
+    end
+  end
+
+  def relative_path(path, dir)
+    Pathname.new(path).relative_path_from(Pathname.new(dir)).to_s
+  end
+
+  def deep_merge(old_hash, new_hash)
+    old_hash.merge(new_hash) do |key, old_value, new_value|
+      if old_value.is_a?(Hash) && new_value.is_a?(Hash)
+        deep_merge(old_value, new_value)
+      else
+        new_hash.key?(key) ? new_value : old_value
+      end
+    end
+  end
+
+  def find_files(dir, glob)
+    if File.directory?(dir)
+      Find.find(dir).each do |path|
+        if File.fnmatch?(glob, path, File::FNM_PATHNAME|File::FNM_CASEFOLD|File::FNM_EXTGLOB) && !File.directory?(path)
+          yield(path)
+        elsif File.basename(path).start_with?('.')
+          Find.prune
+        end
+      end
+    end
+  end
+end
+
+module Jekyll
+  class << self
+    attr_accessor :sites
+  end
+
+  class Plugin
+    PRIORITIES = {
+      :lowest  => -500,
+      :lower   => -250,
+      :low     => -100,
+      :normal  =>    0,
+      :high    =>  100,
+      :higher  =>  250,
+      :highest =>  500,
+    }
+
+    def self.priority(priority = nil)
+      if priority.is_a?(Symbol) && PRIORITIES.key?(priority)
+        @priority = PRIORITIES[priority]
+      elsif priority.is_a?(Numeric)
+        @priority = priority
+      end
+      @priority || PRIORITIES[:normal]
+    end
+
+    def self.<=>(other)
+      other.priority <=> self.priority
+    end
+
+    def self.safe(flag)
+    end
+
+    def initialize(config = {})
+      @config = config
+    end
+
+    # ====================
+    # = Track subclasses =
+    # ====================
+
+    @@plugins = []
+
+    def self.inherited(subclass)
+      @@plugins << subclass
+    end
+
+    def self.plugins_of_type(klass)
+      @@plugins.select { |candidate| candidate < klass }
+    end
+  end
+
+  Generator = Class.new(Plugin)
+  Converter = Class.new(Plugin)
+  Command   = Class.new(Plugin)
+
+  class Hooks
+    def self.register(collection, event, &proc)
+      @hooks ||= []
+      @hooks << { :collection => collection, :event => event, :proc => proc }
+      $log.debug("Register hook for event ‘#{event}’ in collection ‘#{collection}’")
+    end
+
+    def self.invoke(collection, event, file: nil, payload: nil)
+      @hooks.select { |hook| hook[:event] == event && hook[:collection] == collection  }.each do |hook|
+        $log.debug("TODO Invoke #{hook[:proc]}")
+      end
+    end
+  end
+end
+
+module Glim
+  class Filter < Jekyll::Plugin
+    class << self
+      def transforms(hash = nil)
+        @transforms = hash || @transforms
+      end
+
+      def extensions(hash = nil)
+        @extensions = hash || @extensions
+      end
+    end
+
+    def initialize(site)
+    end
+
+    def transform(content, page, options)
+      content
+    end
+  end
+
+  module Filters
+    class Liquid < Glim::Filter
+      transforms 'liquid' => '*'
+      priority :higher
+
+      def initialize(site)
+        @site, @options = site, {
+          :strict_variables => site.config['liquid']['strict_variables'],
+          :strict_filters   => site.config['liquid']['strict_filters'],
+        }
+      end
+
+      def transform(content, page, options)
+        begin
+          template = ::Liquid::Template.parse(Glim.preprocess_template(content))
+          template.render!({ 'site' => @site.to_liquid, 'page' => page.to_liquid }, @options)
+        rescue ::Liquid::Error => e
+          raise Glim::Error.new("While expanding liquid tags in: #{page}", e)
+        end
+      end
+    end
+
+    class Markdown < Glim::Filter
+      transforms 'markdown' => 'html'
+      priority :lower
+
+      def initialize(site)
+        self.class.extensions('markdown' => site.config['markdown_ext'].split(',').each { |ext| ext.strip }.reject { |e| e.empty? })
+
+        legacy = {
+          'syntax_highlighter'      => site.config['highlighter'],
+          'syntax_highlighter_opts' => {},
+        }
+
+        @options = legacy.merge(site.config['kramdown']).map { |key, value| [ key.to_sym, value ] }.to_h
+      end
+
+      def transform(content, page, options)
+        document = Kramdown::Document.new(content, @options)
+        options[:warnings].concat(document.warnings) if options[:warnings] && @options[:show_warnings]
+        document.to_html
+      end
+    end
+
+    class Layout < Glim::Filter
+      transforms '*' => 'output'
+      priority :lowest
+
+      def initialize(site)
+        @site, @options = site, options = {
+          :strict_variables => site.config['liquid']['strict_variables'],
+          :strict_filters   => site.config['liquid']['strict_filters'],
+        }
+      end
+
+      def layouts
+        unless @layouts
+          @layouts = load_layouts(@site.layouts_dir)
+          if dir = @site.theme_dir('_layouts')
+            @layouts = load_layouts(dir, @site.theme_dir('..')).merge(@layouts)
+          end
+        end
+        @layouts
+      end
+
+      def load_layouts(dir, parent = File.dirname(dir))
+        layouts = {}
+        Util.find_files(dir, '**/*.*') do |path|
+          relative_basename = Util.relative_path(path, dir).chomp(File.extname(path))
+          layout = Glim::FileItem.new(@site, path, directory: parent)
+          layouts[relative_basename] = layout
+        end
+        layouts
+      end
+
+      def templates(name, file)
+        @templates ||= {}
+        @templates[name] ||= ::Liquid::Template.parse(Glim.preprocess_template(file.content('liquid')))
+      end
+
+      def transform(content, page, options)
+        return content if %w( .sass .scss .coffee ).include?(page.extname)
+
+        begin
+          layout_data = {}
+          layout_file = page
+          layout_name = page.data['layout']
+          Profiler.group(self.class.name + '::' + layout_file.data['layout']) do
+            while layout_file = self.layouts[layout_name]
+              layout_data.merge!(layout_file.data)
+              template = templates(layout_name, layout_file)
+              content  = template.render!({ 'site' => @site.to_liquid, 'page' => page.to_liquid, 'layout' => HashDrop.new(layout_data), 'content' => content }, @options)
+              layout_name = layout_file.data['layout']
+            end
+          end if self.layouts.has_key?(layout_name)
+        rescue ::Liquid::Error => e
+          raise Glim::Error.new("While using layout: #{layout_file}", e)
+        end
+        content
+      end
+    end
+  end
+
+  class AssociativeArrayDrop < Liquid::Drop
+    include Enumerable
+
+    def initialize(hash, method = :last)
+      @hash, @values = hash, hash.to_a.sort { |a, b| a.first <=> b.first }.map { |a| a.send(method) }
+    end
+
+    def each(&block)
+      @values.each(&block)
+    end
+
+    def liquid_method_missing(name)
+      if @hash.key?(name)
+        @hash[name]
+      elsif name.is_a?(Numeric)
+        @values[name]
+      end
+    end
+  end
+
+  class HashDrop < Liquid::Drop
+    include Enumerable
+
+    def each(&block)
+      @hash.each(&block)
+    end
+
+    def liquid_method_missing(name)
+      @hash[name]
+    end
+
+    def initialize(hash)
+      @hash = hash
+    end
+  end
+
+  class Drop < Liquid::Drop
+    def liquid_method_missing(name)
+      res = if @whitelist.include?(name.to_sym)
+        @object.__send__(name.to_sym)
+      elsif @hash && @hash.key?(name)
+        @hash[name]
+      elsif @proc
+        @proc.call(name)
+      end
+
+      res.is_a?(Hash) ? HashDrop.new(res) : res
+    end
+
+    def initialize(object, whitelist, hash = {}, &proc)
+      @object, @whitelist, @hash, @proc = object, whitelist, hash, proc
+    end
+  end
+
+  # ============
+  # = FileItem =
+  # ============
+
+  class FileItem
+    attr_reader :path, :warnings
+    attr_accessor :next, :previous, :collection_object
+
+    def to_liquid
+      whitelist = [ :url, :path, :relative_path, :name, :title, :next, :previous, :collection, :date, :basename, :extname, :output, :excerpt ]
+      Drop.new(self, whitelist, self.data) do |key|
+        case key
+          when 'content'  then self.content('pre-output')
+          when 'markdown' then self.content('markdown')
+        end
+      end
+    end
+
+    def to_s
+      self.link_path
+    end
+
+    def initialize(site, path = nil, directory: nil, content: nil, frontmatter: nil, defaults: {})
+      @site            = site
+      @path            = path
+      @directory       = directory
+      @defaults        = defaults
+
+      @content         = content
+      @frontmatter     = frontmatter
+      @has_frontmatter = frontmatter || content ? true : nil
+    end
+
+    def title
+      self.data['title'] || (@collection_object ? Util.titlecase(date_and_basename_without_ext.last) : nil)
+    end
+
+    def name
+      File.basename(@path) unless @path.nil?
+    end
+
+    def basename
+      File.basename(@path, '.*') unless @path.nil?
+    end
+
+    def extname
+      File.extname(@path) unless @path.nil?
+    end
+
+    def directory
+      @directory || (@collection_object ? @collection_object.directory : @site.source_dir) unless @path.nil?
+    end
+
+    def relative_path
+      @path && @path.start_with?('/') ? Util.relative_path(@path, self.directory) : @path
+    end
+
+    def link_path
+      Util.relative_path(@path, @collection_object ? File.dirname(@collection_object.directory) : self.directory) if @path
+    end
+
+    def collection
+      @collection_object ? @collection_object.label : nil
+    end
+
+    def date
+      @date ||= if date = Util.parse_date(self.data['date'])
+        date
+      elsif date = date_and_basename_without_ext.first
+        Time.new(*date.split('-'))
+      elsif @path && File.exists?(@path)
+        File.mtime(@path)
+      else
+        Time.now
+      end
+    end
+
+    def url
+      if @url.nil?
+        permalink = self.data['permalink']
+        if permalink.nil?
+          if self.basename == 'index'
+            permalink = '/:path/'
+          elsif self.output_ext == '.html'
+            permalink = '/:path/:basename'
+          else
+            permalink = '/:path/:basename:output_ext'
+          end
+        end
+
+        base   = URI(@site.url)
+        scheme = self.data['scheme']
+        domain = self.data['domain']
+        path   = expand_permalink(permalink)
+
+        @url = if domain && base.host == @site.config['host'] && base.port == @site.config['port']
+          base.merge('/' + domain + path).to_s
+        elsif base.relative?
+          path
+        else
+          base.hostname = domain unless domain.nil?
+          base.scheme   = scheme unless scheme.nil?
+          base.merge(path).to_s
+        end
+      end
+      @url
+    end
+
+    def output_path(output_dir)
+      res = expand_permalink(self.data['permalink'] || '/:path/:basename:output_ext')
+      if res.end_with?('/')
+        res << 'index' << (self.output_ext || '.html')
+      elsif File.extname(res).empty? && self.data['permalink'] && self.output_ext
+        res << self.output_ext
+      end
+      File.expand_path(File.join(output_dir, self.data['domain'] || '.', res[1..-1]))
+    end
+
+    def output_ext
+      pipeline.output_ext(self.extname) || self.extname
+    end
+
+    # ==============
+
+    def format
+      self.data['format'] || pipeline.format_for_filename('liquid' + (self.extname || ''))
+    end
+
+    def frontmatter?
+      load_frontmatter
+      @has_frontmatter
+    end
+
+    def data
+      @data ||= @defaults.merge(load_frontmatter)
+    end
+
+    def merge_data!(data, source: "YAML front matter")
+      self.data.merge!(data)
+      @pipeline = nil
+      @excerpt  = nil
+      @data
+    end
+
+    def write?
+      !@collection_object || @collection_object.write?
+    end
+
+    def content(format = 'post-liquid')
+      pipeline.transform(page: self, content: load_content, from: self.format, to: format, options: { :warnings => @warnings ||= [] })
+    end
+
+    def excerpt
+      @excerpt ||= self.data['excerpt']
+      if @excerpt.nil?
+        parts = content('post-liquid').split(@site.config['excerpt_separator'], 2)
+        if parts.size == 2
+          @excerpt = @site.create_pipeline.transform(page: self, content: parts.first, from: self.format, to: 'pre-output')
+        else
+          @excerpt = content('pre-output')
+        end
+      end
+
+      @excerpt
+    end
+
+    def output
+      content('output')
+    end
+
+    private
+
+    def load_frontmatter
+      if @has_frontmatter.nil? && @path
+        @frontmatter = Glim::Cache.getset(@path, :frontmatter) do
+          open(@path) do |io|
+            if io.read(4) == "---\n"
+              data = ''
+              while line = io.gets
+                break if line == "---\n"
+                data << line
+              end
+              data.strip.empty? ? {} : YAML.load(data)
+            else
+              nil
+            end
+          end
+        end
+        @has_frontmatter = @frontmatter != nil
+      end
+      @frontmatter ||= {}
+    end
+
+    def load_content
+      if @content.nil? && @path
+        open(@path) do |io|
+          @content = io.read
+          @content = @content.split(/^---\n/, 3).last if @content.start_with?("---\n")
+        end
+      end
+      @content ||= ''
+    end
+
+    def pipeline
+      @pipeline ||= @site.create_pipeline
+    end
+
+    def date_and_basename_without_ext
+      if self.basename && self.basename =~ /^(\d{2}\d{2}?-\d{1,2}-\d{1,2}-)?(.+)$/
+        Regexp.last_match.captures
+      else
+        []
+      end
+    end
+
+    def expand_permalink(permalink)
+      permalink = case permalink
+        when 'date'    then '/:categories/:year/:month/:day/:title:output_ext'
+        when 'pretty'  then '/:categories/:year/:month/:day/:title/'
+        when 'ordinal' then '/:categories/:year/:y_day/:title:output_ext'
+        when 'none'    then '/:categories/:title:output_ext'
+        else permalink
+      end
+
+      permalink.gsub(/\{:(\w+)\}|:(\w+)/) do
+        case $1 || $2
+          when 'title'         then !self.frontmatter? ? File.basename(@path) : self.data['slug'] || Util.slugify(date_and_basename_without_ext.last, preserve_case: true)
+          when 'slug'          then !self.frontmatter? ? File.basename(@path) : self.data['slug'] || Util.slugify(date_and_basename_without_ext.last)
+          when 'name'          then !self.frontmatter? ? File.basename(@path) : Util.slugify(date_and_basename_without_ext.last)
+          when 'basename'      then self.basename
+
+          when 'collection'    then self.collection
+          when 'output_ext'    then self.output_ext
+
+          when 'num'           then self.data['paginator'].index
+
+          when 'digest'        then Digest::MD5.hexdigest(self.output) rescue ''
+
+          when 'year'          then self.date.strftime("%Y")
+          when 'month'         then self.date.strftime("%m")
+          when 'day'           then self.date.strftime("%d")
+          when 'hour'          then self.date.strftime("%H")
+          when 'minute'        then self.date.strftime("%M")
+          when 'second'        then self.date.strftime("%S")
+          when 'i_day'         then self.date.strftime("%-d")
+          when 'i_month'       then self.date.strftime("%-m")
+          when 'short_month'   then self.date.strftime("%b")
+          when 'short_year'    then self.date.strftime("%y")
+          when 'y_day'         then self.date.strftime("%j")
+
+          when 'categories' then
+            items = self.data['categories'].to_s
+            items = items.split(' ') if items.is_a?(String)
+            items.map { |category| Util.slugify(category) }.join('/')
+
+          when 'path' then
+            path = File.dirname(@path)
+            if path.start_with?('/')
+              path = Util.relative_path(path, File.expand_path(self.data['base_dir'] || '.', self.directory))
+            end
+            path == '.' ? '' : path
+
+          else
+            $log.warn("#{self}: Unknown permalink variable: ‘#{ $1 || $2 }’")
+            $&
+        end
+      end.gsub(%r{//+}, '/')
+    end
+  end
+
+  # ==============
+  # = Collection =
+  # ==============
+
+  class Collection
+    attr_reader :label, :directory, :docs, :files, :docs_and_files
+
+    def to_liquid
+      whitelist = [ :label, :docs, :files, :relative_directory, :directory, :output ]
+      Drop.new(self, whitelist) do |key|
+        case key
+          when 'categories' then AssociativeArrayDrop.new(categories, :first)
+          when 'tags'       then AssociativeArrayDrop.new(tags, :first)
+          else @data[key]
+        end
+      end
+    end
+
+    def initialize(site, label, directory, docs_and_files, data)
+      docs_and_files.each { |file| file.collection_object = self }
+
+      published = lambda do |file|
+        file.frontmatter? &&
+          (site.config['show_drafts'] || file.data['draft'] != true) &&
+          (site.config['unpublished'] || file.data['published'] != false) &&
+          (site.config['future']      || file.date < Time.now)
+      end
+      docs  = docs_and_files.select(&published)
+      files = docs_and_files.reject(&published)
+
+      sort_property = data['sort_by']
+      docs = docs.sort_by { |file| (sort_property && file.respond_to?(sort_property)) ? file.send(sort_property) : file.basename }
+      docs.each_cons(2) { |first, second| first.next, second.previous = second, first }
+      docs.reverse! if data['sort_descending']
+
+      @site           = site
+      @label          = label
+      @directory      = directory
+      @docs, @files   = docs, files
+      @docs_and_files = docs_and_files
+      @data           = data
+    end
+
+    def generated_files(site)
+      res = []
+      %w( categories tags ).each do |type|
+        if permalink = @data.dig(type, 'permalink')
+          self.send(type.to_sym).each do |name, hash|
+            data = {}
+            data.merge!(site.defaults_for("", "#{@label}.#{type}"))
+            data.merge!(@data[type])
+            data.merge!({
+              'title'     => name,
+              'slug'      => Util.slugify(name),
+              'permalink' => permalink,
+              'posts'     => hash['posts'],
+            })
+
+            res << Glim::FileItem.new(site, frontmatter: data).tap { |page| hash['url'] = page.url }
+          end
+        end
+      end
+      res
+    end
+
+    def write?
+      @data.has_key?('output') ? @data['output'] : %w( defaults categories ).any? { |key| @data.has_key?(key) }
+    end
+
+    def relative_directory
+      Util.relative_path(@directory, @site.source_dir)
+    end
+
+    def categories
+      @categories ||= harvest('category', 'categories')
+    end
+
+    def tags
+      @tags ||= harvest('tags')
+    end
+
+    private
+
+    def harvest(*fields)
+      res = {}
+      self.docs.each do |page|
+        fields.each do |field|
+          if values = page.data[field]
+            values = values.split(' ') if values.is_a?(String)
+            values.each do |value|
+              (res[value] ||= []) << page
+            end
+          end
+        end
+      end
+      res.map { |field_value, pages| [ field_value, { 'posts' => pages } ] }.to_h
+    end
+  end
+
+  # =============
+  # = Paginator =
+  # =============
+
+  class Paginator
+    attr_reader :posts
+    attr_accessor :pages, :index, :next, :previous, :first, :last
+
+    def to_liquid
+      whitelist = [ :posts, :pages, :index, :next, :previous, :first, :last ]
+      Drop.new(self, whitelist)
+    end
+
+    def initialize(posts, index)
+      @posts = posts
+      @index = index
+    end
+  end
+
+  # ========
+  # = Site =
+  # ========
+
+  class Site
+    attr_accessor :url, :time, :config
+    attr_reader :project_dir
+
+    class << self
+      def dir_reader(*dirs)
+        dirs.each do |dir|
+          define_method(dir) do
+            value = @config[dir.to_s] || '.'
+            if value.is_a?(Array)
+              value.map { |path| File.expand_path(path, self.project_dir) }
+            else
+              File.expand_path(value, self.project_dir)
+            end
+          end
+        end
+      end
+    end
+
+    dir_reader :source_dir, :collections_dir, :data_dir, :layouts_dir, :includes_dir, :plugins_dir
+
+    def to_liquid
+      whitelist = [ :url, :time, :data, :pages, :html_pages, :static_files, :html_files, :documents, :posts, :related_posts, :categories, :tags ]
+      Drop.new(self, whitelist) do |key|
+        if collections.key?(key)
+          collections[key].docs
+        elsif key == 'collections'
+          AssociativeArrayDrop.new(collections)
+        else
+          @config[key]
+        end
+      end
+    end
+
+    def initialize(options = {})
+      @config = options
+
+      @project_dir = File.expand_path(@config['source'])
+      @url         = @config['url']
+      @time        = Time.now
+
+      Liquid::Template.file_system = Glim::LocalFileSystem.new(self.includes_dir, self.theme_dir('_includes'))
+      Liquid::Template.error_mode  = @config['liquid']['error_mode'].to_sym
+
+      Jekyll.sites = [ self ]
+      load_plugins
+      run_generators
+    end
+
+    def files
+      unless @files
+        @files = load_pages(self.source_dir, @config['include'], @config['exclude'])
+        if asset_dir = self.theme_dir('assets')
+          @files += load_pages(asset_dir, @config['include'], @config['exclude'], directory: File.dirname(asset_dir))
+        end
+      end
+      @files
+    end
+
+    def collections
+      @collections ||= load_collections(@config['collections'], self.collections_dir, @config['include'], @config['exclude'])
+    end
+
+    def data
+      @data ||= load_data(self.data_dir)
+    end
+
+    REDIRECT_TEMPLATE = <<~HTML
+      <!DOCTYPE html>
+      <html lang="en-US">
+        <meta charset="utf-8">
+        <title>Redirecting&hellip;</title>
+        <link rel="canonical" href="{{ page.redirect_to }}">
+        <script>location="{{ page.redirect_to }}"</script>
+        <meta http-equiv="refresh" content="0; url={{ page.redirect_to }}">
+        <meta name="robots" content="noindex">
+        <h1>Redirecting&hellip;</h1>
+        <a href="{{ page.redirect_to }}">Click here if you are not redirected.</a>
+      </html>
+    HTML
+
+    def generated_files
+      res = self.collections.map { |_, collection| collection.generated_files(self) }.flatten
+
+      domains = {}
+
+      files = [ *self.files, *self.documents ]
+      files.each do |file|
+        if redirect_from = file.data['redirect_from']
+          redirect_from = redirect_from.split(' ') if redirect_from.is_a?(String)
+          redirect_from.each do |path|
+            domain = file.data['domain'] || URI(self.url).host
+            domains[domain] ||= {}
+            domains[domain][path] = file.url
+
+            if path.end_with?('/')
+              path = path + file.name
+            elsif File.extname(path).empty?
+              path = path + file.extname
+            end
+            res << Glim::FileItem.new(self, frontmatter: { 'permalink' => path, 'domain' => file.data['domain'], 'redirect_to' => file.url }, content: REDIRECT_TEMPLATE)
+          end
+          $log.warn("Generated redirect to non-HTML file: #{file}") unless file.output_ext == '.html'
+        end
+      end
+
+      unless domains.empty?
+        res << Glim::FileItem.new(self, frontmatter: { 'permalink' => '/redirects.json' }, content: { 'domains' => domains }.to_json + "\n")
+      end
+
+      files.each do |file|
+        if paginate = file.data['paginate']
+          per_page  = paginate['per_page'] || 25
+          permalink = paginate['permalink']
+
+          items = []
+          if key = paginate['collection']
+            $log.warn("No collection named #{key}") unless collections.key?(key)
+            items = collections[key].docs if collections.key?(key)
+            permalink ||= "/#{key}/page/:num/"
+          elsif key = paginate['data']
+            $log.warn("No data named #{key}") unless self.data.key?(key)
+            items = self.data[key] if self.data.key?(key)
+            permalink ||= "/#{key}/page/:num/"
+          end
+
+          if sort_property = paginate['sort_by']
+            items = items.sort_by do |item|
+              if item.is_a?(Hash)
+                item[sort_property]
+              elsif items.is_a?(Hash) && item.is_a?(Array) && item.last.is_a?(Hash)
+                item.last[sort_property]
+              elsif item.respond_to?(sort_property)
+                item.send(sort_property)
+              else
+                raise "Pagination failed for #{key} in #{file}: Unknown sort property: #{sort_property}"
+              end
+            end
+          elsif paginate['sort']
+            items = items.sort
+          end
+          items = items.reverse if paginate['sort_descending']
+
+          chunks = items.each_slice(per_page)
+          pages = chunks.each_with_index.map do |posts, i|
+            paginator = Paginator.new(posts, i + 1)
+            if i == 0
+              file.merge_data!({ 'paginator' => paginator })
+              file
+            else
+              clone = Glim::FileItem.new(self, file.path, defaults: file.data)
+              clone.merge_data!({ 'paginator' => paginator, 'permalink' => permalink })
+              clone
+            end
+          end
+
+          pages.each { |page| page.data['paginator'].pages = pages }
+
+          pages.each_cons(2) do |first, second|
+            first.data['paginator'].next, second.data['paginator'].previous = second, first
+            first.data['paginator'].last, second.data['paginator'].first    = pages.last, pages.first
+          end
+
+          res += pages[1..-1] unless pages.empty?
+        end
+      end
+
+      res
+    end
+
+    def files_and_documents
+      @files_and_documents ||= [ *self.files, *self.documents, *self.generated_files ]
+    end
+
+    def symlinks
+      files_and_documents # Trigger dir scan
+      @symlinks
+    end
+
+    # ================================
+    # = Return a subset of all files =
+    # ================================
+
+    def pages
+      files.select { |file| file.frontmatter? }
+    end
+
+    def html_pages
+      pages.select { |page| page.extname == '.html' }
+    end
+
+    def static_files
+      files.reject { |file| file.frontmatter? }
+    end
+
+    def html_files
+      static_files.select { |page| page.extname == '.html' }
+    end
+
+    def documents
+      collections.map { |_, collection| collection.docs_and_files }.flatten
+    end
+
+    def posts
+      collections['posts'].docs if collections.key?('posts')
+    end
+
+    def related_posts # TODO
+      []
+    end
+
+    def categories
+      collections['posts'].categories.map { |category, hash| [ category, hash['posts'] ] }.to_h if collections.key?('posts')
+    end
+
+    def tags
+      collections['posts'].tags.map { |tag, hash| [ tag, hash['posts'] ] }.to_h if collections.key?('posts')
+    end
+
+    # ============================
+    # = These are not public API =
+    # ============================
+
+    def links
+      if @links.nil?
+        transform = [
+          [ /([^\/]+)\.\w+$/, '\1' ],
+          [ /\/index\.\w+$/,  '/'  ],
+          [ /^index\.\w+$/,   '.'  ],
+        ]
+
+        @links = [ *self.files, *self.documents ].map { |file| [ file.link_path, file ] }.to_h
+        @links.keys.each do |path|
+          transform.each do |search, replace|
+            shorthand = path.sub(search, replace)
+            @links[shorthand] = @links[path] unless @links.key?(shorthand)
+          end
+        end
+      end
+      @links
+    end
+
+    def post_links
+      @post_links ||= self.posts.map { |file| [ file.basename, file ] }.to_h
+    end
+
+    def theme_dir(subdir = '.')
+      unless @did_load_theme
+        @did_load_theme = true
+
+        if theme = @config['theme']
+          begin
+            if theme_gem = Gem::Specification.find_by_name(theme)
+              @theme_dir = theme_gem.full_gem_path
+
+              $log.debug("Theme dependencies: #{theme_gem.runtime_dependencies.join(', ')}")
+              theme_gem.runtime_dependencies.each do |dep|
+                Glim.require(dep.name)
+              end
+
+              if sass_dir = self.theme_dir('_sass')
+                Glim.require 'sass' unless defined?(::Sass)
+                Glim.require 'glim-sass-converter'
+                Sass.load_paths << sass_dir unless Sass.load_paths.include?(sass_dir)
+              end
+            end
+          rescue Gem::LoadError => e
+            $log.warn("Unable to load the #{theme} theme: #{e}")
+          end
+        end
+      end
+
+      if @theme_dir && File.directory?(File.join(@theme_dir, subdir))
+        File.join(@theme_dir, subdir)
+      else
+        nil
+      end
+    end
+
+    def defaults_for(path, type)
+      data = {}
+      @config['defaults'].each do |defaults|
+        if match = defaults['match']
+          next unless Array(match).any? do |glob|
+            glob = glob + '**/{*,.*}' if glob.end_with?('/')
+            File.fnmatch?(glob, path, File::FNM_PATHNAME|File::FNM_CASEFOLD|File::FNM_EXTGLOB)
+          end
+        end
+
+        if scope = defaults['scope']
+          next if scope.key?('path') && !path.start_with?(scope['path'])
+          next if scope.key?('type') && type != scope['type']
+
+          if globs = scope['glob']
+            globs = [ globs ] if globs.is_a?(String)
+            next unless globs.any? do |glob|
+              glob = glob + '**/{*,.*}' if glob.end_with?('/')
+              File.fnmatch?(glob, path, File::FNM_PATHNAME|File::FNM_CASEFOLD|File::FNM_EXTGLOB)
+            end
+          end
+        end
+
+        data.merge!(defaults['values'])
+      end
+      data
+    end
+
+    def create_pipeline
+      @pipeline_builder ||= PipelineBuilder.new(self)
+      Pipeline.new(@pipeline_builder)
+    end
+
+    private
+
+    def matches?(path, globs)
+      globs.find do |glob|
+        File.fnmatch?(glob, path) || File.fnmatch?(glob, File.basename(path))
+      end
+    end
+
+    def run_generators
+      Jekyll::Plugin.plugins_of_type(Jekyll::Generator).sort.each do |klass|
+        Profiler.run("Letting #{klass} generate pages") do
+          begin
+            klass.new(@config).generate(self)
+          rescue => e
+            $log.error("Error running #{klass}#generate: #{e}")
+          end
+        end
+      end
+    end
+
+    def load_plugins
+      @config['plugins'].each do |name|
+        Profiler.run("Loading #{name} plugin") do
+          Glim.require(name)
+        end
+      end
+
+      Array(self.plugins_dir).each do |dir|
+        Util.find_files(dir, '**/*.rb') do |path|
+          Profiler.run("Loading #{Util.relative_path(path, dir)} plugin") do
+            Glim.require(path)
+          end
+        end
+      end
+    end
+
+    def load_pages(dir, include_globs, exclude_globs, relative_to = dir, collection = nil, defaults = {}, directory: nil)
+      pages = []
+      if File.directory?(dir)
+        Find.find(dir) do |path|
+          next if path == dir
+          name = File.basename(path)
+          relative_path = Util.relative_path(path, relative_to)
+          dir_suffix = File.directory?(path) ? '/' : ''
+
+          Find.prune if name.start_with?('_')
+          unless matches?(relative_path + dir_suffix, include_globs)
+            Find.prune if name.start_with?('.') || matches?(relative_path + dir_suffix, exclude_globs)
+          end
+
+          settings = defaults_for(relative_path, collection || 'pages').merge(defaults)
+
+          if File.symlink?(path)
+            begin
+              realpath = Pathname.new(path).realpath.to_s
+
+              if File.directory?(realpath)
+                relative_path = Util.relative_path(path, settings['base_dir']) if settings.key?('base_dir')
+                (@symlinks ||= []) << { :name => relative_path, :realpath => realpath, :data => settings }
+              end
+            rescue Errno::ENOENT
+              $log.warn("No target for symbolic link: #{relative_path} → #{File.readlink(path)}")
+              next
+            end
+          end
+
+          pages << Glim::FileItem.new(self, path, directory: directory || dir, defaults: settings) if File.file?(path)
+        end
+      end
+      pages
+    end
+
+    def load_collections(collections, dir, include_globs, exclude_globs)
+      res = {}
+      collections.each do |collection, data|
+        collection_dir = File.expand_path("_#{collection}", dir)
+        if File.directory?(collection_dir)
+          Profiler.run("Loading #{collection} collection") do
+            defaults = { 'permalink' => data['permalink'], 'base_dir' => collection_dir }
+            defaults.merge!(data['defaults']) if data.key?('defaults')
+            files = load_pages(collection_dir, include_globs, exclude_globs, dir, collection, defaults)
+            if data.key?('drafts_dir')
+              drafts_dir = File.expand_path(data['drafts_dir'], dir)
+              defaults.merge!({ 'base_dir' => drafts_dir, 'draft' => true })
+              files += load_pages(drafts_dir, include_globs, exclude_globs, dir, collection, defaults)
+            end
+            res[collection] = Collection.new(self, collection, collection_dir, files, data)
+          end
+        end
+      end
+      res
+    end
+
+    def load_data(dir)
+      data = {}
+      Util.find_files(dir, '**/*.{yml,yaml,json,csv,tsv}') do |path|
+        relative_basename = Util.relative_path(path, dir).chomp(File.extname(path))
+        begin
+          res = case File.extname(path).downcase
+            when '.yaml', '.yml'
+              YAML.load_file(path)
+            when '.json'
+              JSON.parse(File.read(path))
+            when '.csv'
+              CSV.read(path, { :headers  => true }).map(&:to_hash)
+            when ".tsv"
+              CSV.read(path, { :headers  => true, :col_sep  => "\t" }).map(&:to_hash)
+          end
+
+          *keys, last = relative_basename.split('/')
+          keys.inject(data) { |hash, key| hash[key] ||= {} }[last] = res
+        rescue => e
+          $log.error("Error loading data file ‘#{path}’: #{e}")
+        end
+      end
+      data
+    end
+
+    class Pipeline
+      def initialize(builder)
+        @builder = builder
+      end
+
+      def format_for_filename(filename)
+        input_ext = File.extname(filename)
+        from, _ = @builder.transformation_for_extension(input_ext)
+        from ? (filename.chomp(input_ext) + '.' + from) : filename
+      end
+
+      def output_ext(input_ext)
+        _, to = @builder.transformation_for_extension(input_ext)
+        to ? ('.' + to) : nil
+      end
+
+      def transform(page: nil, content: nil, from: 'liquid', to: 'output', options: {})
+        pipeline_for(from, to).inject(content) do |res, node|
+          node.transform(res, page, options)
+        end
+      end
+
+      private
+
+      def pipeline_for(from_format, to_format)
+        @pipeline ||= @builder.pipeline_for(from_format)
+
+        is_pre_match, is_post_match = to_format.start_with?('pre-'), to_format.start_with?('post-')
+        is_full_match = !is_pre_match && !is_post_match
+
+        nodes = []
+        @pipeline.each do |node|
+          break if is_full_match && node.from_format.start_with?(to_format) && !node.to_format.start_with?(to_format)
+          break if is_pre_match && node.to_format.start_with?(to_format[4..-1])
+          nodes << node
+          break if is_post_match && node.from_format.start_with?(to_format[5..-1]) && !node.to_format.start_with?(to_format[5..-1])
+        end
+
+        nodes
+      end
+    end
+
+    class PipelineBuilder
+      def initialize(site)
+        temp = []
+
+        Jekyll::Plugin.plugins_of_type(Glim::Filter).each do |klass|
+          filter = klass.new(site)
+          filter.class.transforms.each do |from, to|
+            temp << [ filter, from, to ]
+          end
+        end
+
+        @transformations = temp.sort_by do |filter, from, to|
+          [ -filter.class.priority, (from.partition('.').first != to.partition('.').first ? +1 : -1) ]
+        end
+
+        @cache = {}
+      end
+
+      def transformation_for_extension(ext)
+        Jekyll::Plugin.plugins_of_type(Glim::Filter).sort.each do |klass|
+          klass.transforms.each do |from, to|
+            next if from == '*' || to == '*' || from.partition('.').first == to.partition('.').first
+
+            input_extensions = if klass.extensions && klass.extensions.key?(from)
+              klass.extensions[from]
+            else
+              [ from ]
+            end
+
+            input_extensions.each do |input_ext|
+              if ext == '.' + input_ext
+                return [ from, to ]
+              end
+            end
+          end if klass.transforms
+        end
+        nil
+      end
+
+      def pipeline_for(from_format)
+        (@cache[from_format] ||= create_pipeline(from_format)).map { |node| node.dup }
+      end
+
+      def create_pipeline(format)
+        result_nodes, transformations = [], @transformations.dup
+        while transformation = transformations.find { |_, from, to| from == format || from == format.partition('.').first || (from == '*' && to.partition('.').first != format.partition('.').first) }
+          filter, from, to = *transformation
+
+          format = if from == '*' && to == '*'
+            format
+          elsif from == '*'
+            "#{to}.#{format}"
+          elsif to == '*'
+            format.partition('.').last
+          else
+            to
+          end
+
+          result_nodes << PipelineNode.new(filter, from, to)
+          transformations.delete(transformation)
+        end
+        result_nodes
+      end
+
+      class PipelineNode
+        attr_reader :from_format, :to_format
+
+        def initialize(filter, from_format, to_format)
+          @filter, @from_format, @to_format = filter, from_format, to_format
+        end
+
+        def dup
+          PipelineNode.new(@filter, @from_format, @to_format)
+        end
+
+        def transform(content, page, options)
+          if @cache.nil?
+            Profiler.group(@filter.class.name) do
+              @cache = @filter.transform(content, page, options).freeze
+            end
+          end
+          @cache
+        end
+      end
+    end
+  end
+
+  # ==========
+  # = Config =
+  # ==========
+
+  class Config
+    def initialize(files: nil, defaults: nil, override: nil)
+      @files    = files    || %w( _config.yml )
+      @defaults = defaults || {}
+      @override = override || {}
+    end
+
+    def site
+      @site ||= Glim::Site.new(self.to_h)
+    end
+
+    def [](key)
+      self.to_h[key]
+    end
+
+    def []=(key, value)
+      @override[key] = value
+      @loaded[key] = value if @loaded
+    end
+
+    def reload
+      @loaded, @site = nil, nil
+    end
+
+    def to_h
+      @loaded ||= load_config
+    end
+
+    private
+
+    DEFAULT_CONFIG = {
+      # Where things are
+      "source"              => ".",
+      "source_dir"          => ".",
+      "destination"         => "_site",
+      "collections_dir"     => ".",
+      "plugins_dir"         => "_plugins",
+      "layouts_dir"         => "_layouts",
+      "data_dir"            => "_data",
+      "includes_dir"        => "_includes",
+      "collections"         => {
+        "posts" => {
+          "output"          => true,
+          "sort_by"         => "date",
+          "sort_descending" => true,
+          "drafts_dir"      => "_drafts",
+        }
+      },
+
+      # Handling Reading
+      "include"             => [".htaccess"],
+      "exclude"             => %w(
+        Gemfile Gemfile.lock node_modules vendor/bundle/ vendor/cache/ vendor/gems/
+        vendor/ruby/
+      ),
+      "keep_files"          => [".git", ".svn"],
+      "encoding"            => "utf-8",
+      "markdown_ext"        => "markdown,mkdown,mkdn,mkd,md",
+
+      # Filtering Content
+      "future"              => false,
+      "unpublished"         => false,
+
+      # Plugins
+      "whitelist"           => [],
+      "plugins"             => [],
+
+      # Conversion
+      "highlighter"         => "rouge",
+      "excerpt_separator"   => "\n\n",
+
+      # Serving
+      "detach"              => false, # default to not detaching the server
+      "port"                => 4000,
+      "host"                => "127.0.0.1",
+      "show_dir_listing"    => true,
+      "livereload"          => true,
+      "livereload_port"     => 35729,
+
+      # Output Configuration
+      "permalink"           => "date",
+      "timezone"            => nil, # use the local timezone
+
+      "quiet"               => false,
+      "verbose"             => false,
+      "defaults"            => [],
+
+      "liquid"              => {
+        "error_mode"       => "warn",
+        "strict_filters"   => false,
+        "strict_variables" => false,
+      },
+
+      "kramdown"            => {
+        "auto_ids"      => true,
+        "toc_levels"    => "1..6",
+        "entity_output" => "as_char",
+        "smart_quotes"  => "lsquo,rsquo,ldquo,rdquo",
+        "input"         => "GFM",
+        "hard_wrap"     => false,
+        "footnote_nr"   => 1,
+        "show_warnings" => false,
+      },
+    }
+
+    def load_config
+      initial = Util.deep_merge(DEFAULT_CONFIG, @defaults)
+      initial = @files.inject(initial) do |mem, file|
+        begin
+          Util.deep_merge(mem, YAML.load_file(file))
+        rescue => e
+          raise "Unable to load #{file}: #{e}"
+        end
+      end
+      initial = Util.deep_merge(initial, @override)
+      initial['collections']['posts']['permalink'] ||= initial['permalink']
+      initial
+    end
+  end
+
+  # ==================
+  # = Custom Require =
+  # ==================
+
+  REPLACEMENT_GEMS = {
+    'jekyll'         => nil,
+    'jekyll-feed'    => 'glim-feed',
+    'jekyll-seo-tag' => 'glim-seo-tag',
+  }
+
+  def self.require(name)
+    @@loaded_gems ||= {}
+
+    unless @@loaded_gems.has_key?(name)
+      @@loaded_gems[name] = false
+
+      begin
+        @@loaded_gems[name] = true
+        if REPLACEMENT_GEMS.key?(name)
+          if replacement = REPLACEMENT_GEMS[name]
+            $log.warn("Using #{replacement} instead of #{name}")
+            Kernel.require replacement
+          end
+        else
+          Kernel.require name
+        end
+      rescue LoadError => e
+        $log.warn("Error loading ‘#{name}’: #{e}")
+      end
+    end
+
+    @@loaded_gems[name]
+  end
+end
+
+def add_program_options(cmd)
+  cmd.option 'config',                    '--config CONFIG_FILE[,CONFIG_FILE2,...]', Array, 'Custom configuration file(s)'
+  cmd.option 'source',              '-s', '--source SOURCE',           'Custom source directory'
+  cmd.option 'future',                    '--future',                  'Publish posts with a future date'
+  cmd.option 'show_drafts',         '-D', '--drafts',                  'Publish posts in draft folders'
+  cmd.option 'unpublished',               '--unpublished',             'Publish posts marked as unpublished'
+  cmd.option 'quiet',               '-q', '--quiet',                   'Silence output'
+  cmd.option 'verbose',             '-V', '--verbose',                 'Print verbose output'
+  cmd.option 'plugins_dir',         '-p', '--plugins PLUGINS_DIR1[,PLUGINS_DIR2[,...]]', Array, 'Custom plugins directory'
+  cmd.option 'layouts_dir',               '--layouts DIR', String,     'Custom layouts directory'
+end
+
+Mercenary.program(:glim) do |p|
+  p.version Glim::VERSION
+  p.description 'Glim is a static site generator which is semi-compatible with Jekyll'
+  p.syntax 'glim <subcommand> [options]'
+
+  p.command(:build) do |c|
+    c.syntax 'build'
+    c.description 'Build your site'
+    c.alias :b
+    c.option 'jobs',        '-j', '--jobs N', Integer,         'Use N simultaneous jobs when building site'
+    c.option 'destination', '-d', '--destination DESTINATION', 'Set destination directory for generated files'
+    c.option 'profile',           '--profile',                 'Show timing information'
+    add_program_options(c)
+
+    c.action do |args, options|
+      Profiler.enabled = options['profile']
+
+      config = Glim::Config.new(files: options['config'], defaults: { 'environment' => 'production' }, override: options)
+      config['show_backtrace'] = true if c.trace
+      Glim::Commands.build(config)
+
+      Profiler.run("Saving cache") do
+        Glim::Cache.save
+      end
+
+      Profiler.enabled = false
+    end
+  end
+
+  p.command(:clean) do |c|
+    c.syntax 'clean'
+    c.description 'Delete files in build directory'
+    c.option 'destination', '-d', '--destination DESTINATION', 'Set the directory to clean'
+    c.option 'dry_run',           '--dry-run',                 'Only show which files would be deleted'
+
+    c.action do |args, options|
+      Glim::Commands.clean(Glim::Config.new(files: options['config'], defaults: { 'environment' => 'production' }, override: options))
+    end
+  end
+
+  p.command(:serve) do |c|
+    c.syntax 'serve'
+    c.description 'Serve your site locally'
+    c.alias :s
+    c.option 'open_url',        '-o', '--open-url',                        'Launch your site in a browser'
+    c.option 'watch',           '-w', '--[no-]watch',                      'Watch for changes and rebuild'
+    c.option 'livereload',      '-l', '--[no-]livereload',                 'Automatically send reload to browser on changes'
+    c.option 'livereload_port',       '--livereload-port [PORT]', Integer, 'Port to use for reload WebSocket server'
+    add_program_options(c)
+
+    c.action do |args, options|
+      require_relative '../lib/local_server'
+      config = Glim::Config.new(files: options['config'], defaults: { 'environment' => 'development' }, override: options)
+      Glim::LocalServer.start(config)
+    end
+  end
+
+  p.command(:profile) do |c|
+    c.syntax 'profile'
+    c.description 'Profile your site'
+    add_program_options(c)
+    c.action do |args, options|
+      Glim::Commands.profile(Glim::Config.new(files: options['config'], defaults: { 'environment' => 'production' }, override: options))
+    end
+  end
+
+  Bundler.require(:glim_plugins) if defined?(Bundler) && File.exists?('Gemfile')
+
+  Jekyll::Plugin.plugins_of_type(Jekyll::Command).sort.each do |klass|
+    klass.init_with_program(p)
+  end
+
+  p.command(:help) do |c|
+    c.syntax 'help [subcommand]'
+    c.description 'Show this help message, optionally for a given subcommand'
+
+    c.action do |args, _|
+      if cmd = args.shift
+        if p.has_command?(cmd.to_sym)
+          STDOUT.puts "#{p.commands[cmd.to_sym]}\n"
+        else
+          STDOUT.puts "Error: No subcommand named ‘#{cmd}’.\n"
+          STDOUT.puts "Valid commands are: #{p.commands.keys.join(', ')}\n"
+        end
+      else
+        STDOUT.puts "#{p}\n"
+      end
+    end
+  end
+
+  p.default_command(:help)
+end
