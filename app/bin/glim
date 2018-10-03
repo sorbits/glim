@@ -174,7 +174,11 @@ module Glim
     end
 
     def transform(content, page, options)
-      content
+      if options[:filters].empty?
+        content
+      else
+        options[:filters].shift.transform(content, page, options)
+      end
     end
   end
 
@@ -1257,8 +1261,16 @@ module Glim
             to
           end
 
-          result_nodes << PipelineNode.new(filter, from, to)
-          transformations.delete(transformation)
+          filters = [ filter ]
+
+          if from.partition('.').first != to.partition('.').first
+            filters = transformations.select { |_, filter_from, filter_to| from == filter_from && to == filter_to }.map { |f, _, _| f }
+            transformations.reject! { |_, filter_from, filter_to| from == filter_from && to = filter_to }
+          else
+            transformations.delete(transformation)
+          end
+
+          result_nodes << PipelineNode.new(filters, from, to)
         end
         result_nodes
       end
@@ -1266,18 +1278,19 @@ module Glim
       class PipelineNode
         attr_reader :from_format, :to_format
 
-        def initialize(filter, from_format, to_format)
-          @filter, @from_format, @to_format = filter, from_format, to_format
+        def initialize(filters, from_format, to_format)
+          @filters, @from_format, @to_format = filters, from_format, to_format
         end
 
         def dup
-          PipelineNode.new(@filter, @from_format, @to_format)
+          PipelineNode.new(@filters, @from_format, @to_format)
         end
 
         def transform(content, page, options)
           if @cache.nil?
-            Profiler.group(@filter.class.name) do
-              @cache = @filter.transform(content, page, options).freeze
+            filter, *filters = @filters
+            Profiler.group(filter.class.name) do
+              @cache = filter.transform(content, page, options.merge({ :filters => filters })).freeze
             end
           end
           @cache
