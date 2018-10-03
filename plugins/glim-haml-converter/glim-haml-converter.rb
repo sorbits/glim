@@ -1,6 +1,6 @@
 require 'haml'
 
-module GlimExtensions
+module GlimHAMLSupport
   class ExposeLiquidFilters
     def initialize(site, page)
       @context = Liquid::Context.new({ 'site' => site, 'page' => page })
@@ -21,7 +21,7 @@ module GlimExtensions
     end
   end
 
-  class HTMLAbstractionMarkupLanguage < Glim::Filter
+  class HAMLToHTML < Glim::Filter
     transforms 'haml' => 'html'
 
     def initialize(site)
