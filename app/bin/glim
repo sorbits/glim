@@ -454,7 +454,7 @@ module Glim
     end
 
     def output_ext
-      pipeline.output_ext(self.extname) || self.extname
+      frontmatter? && pipeline.output_ext(self.extname) || self.extname
     end
 
     # ==============
