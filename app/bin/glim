@@ -224,7 +224,7 @@ module Glim
 
     class Layout < Glim::Filter
       transforms '*' => 'output'
-      priority :lowest
+      priority :lower
 
       def initialize(site)
         @site, @options = site, options = {
@@ -1211,7 +1211,7 @@ module Glim
         end
 
         @transformations = temp.sort_by do |filter, from, to|
-          [ -filter.class.priority, (from.partition('.').first != to.partition('.').first ? +1 : -1) ]
+          [ (from == '*' ? +1 : -1), -filter.class.priority, (from.partition('.').first != to.partition('.').first ? +1 : -1) ]
         end
 
         @cache = {}
