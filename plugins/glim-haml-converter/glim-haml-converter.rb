@@ -29,7 +29,7 @@ module GlimExtensions
     end
 
     def transform(content, page, options)
-      engine = Haml::Engine.new(content)
+      engine  = Haml::Engine.new(content)
       content = engine.render(ExposeLiquidFilters.new(@site, page), :content => content, :page => ExposeLiquidGetterAPI.new(page), :site => ExposeLiquidGetterAPI.new(@site))
     end
   end
