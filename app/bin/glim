@@ -51,9 +51,13 @@ module Util
 
   def titlecase(input)
     unless input.nil?
-      words  = /\A\p{^Lower}+\z|\b\p{Upper}\p{^Upper}+?\b/
-      upcase = /^([\W\d]*)(\w[-\w]*)|\b((?!(?:else|from|over|then|when)\b)\w[-\w]{3,}|\w[-\w]*[\W\d]*$)/
-      input.gsub(/[ _-]+/, ' ').gsub(words) { $&.downcase }.gsub(upcase) { $1 ? ($1 + $2[0].upcase + $2[1..-1]) : ($&[0].upcase + $&[1..-1]) }
+      input.gsub(/[ _-]+/, ' ').gsub(/(\A)?(\w)(\w*)([^\s]*)(\z)?/) do |match|
+        if $1 || $5 || $3.size > 2
+          $2.upcase + $3 + $4
+        else
+          $&
+        end
+      end
     end
   end
 
