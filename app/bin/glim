@@ -19,8 +19,8 @@ require 'mercenary'
 if File.exists?('Gemfile')
   begin
     require 'bundler/setup'
-  rescue LoadError => e
-    $log.warn("Unable to load Bundler but directory contains a Gemfile")
+  rescue LoadError
+    $log.warn("Unable to load Bundler: Ignoring ./Gemfile")
   end
 end
 
