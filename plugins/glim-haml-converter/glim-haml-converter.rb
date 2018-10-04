@@ -29,7 +29,7 @@ module GlimHAMLSupport
     end
 
     def transform(content, page, options)
-      engine  = Haml::Engine.new(content)
+      engine  = Haml::Engine.new(content, { :escape_attrs => :once })
       content = engine.render(ExposeLiquidFilters.new(@site, page), :content => content, :page => ExposeLiquidGetterAPI.new(page), :site => ExposeLiquidGetterAPI.new(@site))
     end
   end
@@ -56,7 +56,7 @@ module GlimHAMLSupport
       layout = page.data['layout']
       if find_layout(layout)
         while layout_file = find_layout(layout)
-          engine  = Haml::Engine.new(layout_file.content('liquid'))
+          engine  = Haml::Engine.new(layout_file.content('liquid'), { :escape_attrs => :once })
           content = engine.render(ExposeLiquidFilters.new(@site, page), :content => content, :page => ExposeLiquidGetterAPI.new(page), :site => ExposeLiquidGetterAPI.new(@site))
           layout  = layout_file.data['layout']
         end
