@@ -235,7 +235,7 @@ module Glim
     def self.generate_subset(output_dir, files, backtrace: false)
       created, updated, warnings, errors = [], [], [], []
 
-      for file in files do
+      files.each do |file|
         dest = file.output_path(output_dir)
         file_exists = File.exists?(dest)
 
