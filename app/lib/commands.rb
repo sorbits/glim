@@ -152,7 +152,7 @@ module Glim
         end
       end
 
-      dirs.sort.reverse.each do |path|
+      dirs.sort.reverse_each do |path|
         begin
           Dir.rmdir(path)
         rescue Errno::ENOTEMPTY => e

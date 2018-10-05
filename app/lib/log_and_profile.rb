@@ -100,13 +100,13 @@ class Profiler
       STDERR.puts indent(level) + (@format % @duration)
 
       if @groups
-        @groups.sort_by { |group, info| info[:duration] }.reverse.each do |group, info|
+        @groups.sort_by { |group, info| info[:duration] }.reverse_each do |group, info|
           STDERR.puts indent(level+1) + "[#{group}: %.3f seconds, called #{info[:count]} time(s), %.3f seconds/time]" % [ info[:duration], info[:duration] / info[:count] ]
         end
       end
 
       if @children
-        @children.sort_by { |child| child.duration }.reverse.each do |child|
+        @children.sort_by { |child| child.duration }.reverse_each do |child|
           child.dump(level + 1)
         end
       end
