@@ -877,7 +877,7 @@ module Glim
           chunks = items.each_slice(per_page)
           pages = chunks.each_with_index.map do |posts, i|
             paginator = Paginator.new(posts, i + 1)
-            if i == 0
+            if i.zero?
               file.merge_data!({ 'paginator' => paginator })
               file
             else
