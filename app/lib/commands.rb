@@ -34,7 +34,7 @@ module Glim
       end
 
       unless warnings.empty?
-        STDERR.puts "==> #{warnings.count} #{warnings.count == 1 ? 'Warnings' : 'Warning'}"
+        STDERR.puts "==> #{warnings.count} #{warnings.count == 1 ? 'Warning' : 'Warnings'}"
         warnings.each do |message|
           STDERR.puts message
         end
