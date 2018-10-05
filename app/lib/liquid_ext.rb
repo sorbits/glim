@@ -4,6 +4,8 @@ require 'liquid'
 module Glim
   module LiquidFilters
     def markdownify(input)
+      return if input.nil?
+      
       Profiler.group('markdownify') do
         if defined?(MultiMarkdown)
           MultiMarkdown.new("\n" + input, 'snippet', 'no_metadata').to_html
@@ -12,7 +14,7 @@ module Glim
           document = Kramdown::Document.new(input, options)
           @context['warnings'].concat(document.warnings) if options[:show_warnings] && @context['warnings']
           document.to_html
-        end unless input.nil?
+        end
       end
     end
 
@@ -29,18 +31,24 @@ module Glim
     end
 
     def absolute_url(path)
-      unless path.nil?
-        site, page = URI(@context['site']['url']), URI(@context['page']['url'])
-        host, port = @context['site']['host'], @context['site']['port']
-        if page.relative? || (site.host == host && site.port == port)
-          site.merge(URI(path)).to_s
-        else
-          page.merge(URI(path)).to_s
-        end
+      return if path.nil?
+      
+      site, page = URI(@context['site']['url']), URI(@context['page']['url'])
+      host, port = @context['site']['host'], @context['site']['port']
+      
+      if page.relative? || (site.host == host && site.port == port)
+        site.merge(URI(path)).to_s
+      else
+        page.merge(URI(path)).to_s
       end
     end
 
     def relative_url(other)
+      return if other.nil?
+      
+      site, page = URI(@context['site']['url']), URI(@context['page']['url'])
+      host, port = @context['site']['host'], @context['site']['port']
+      
       helper = lambda do |base, other|
         base_url, other_url = URI(base), URI(other)
         if other_url.absolute? && base_url.host == other_url.host
@@ -49,24 +57,22 @@ module Glim
           other
         end
       end
-
-      unless other.nil?
-        site, page = URI(@context['site']['url']), URI(@context['page']['url'])
-        host, port = @context['site']['host'], @context['site']['port']
-        if page.relative? || (site.host == host && site.port == port)
-          helper.call(@context['site']['url'], other)
-        else
-          helper.call(@context['page']['url'], other)
-        end
+      
+      if page.relative? || (site.host == host && site.port == port)
+        helper.call(@context['site']['url'], other)
+      else
+        helper.call(@context['page']['url'], other)
       end
     end
 
     def path_to_url(input)
+      return if input.nil?
+      
       if file = Jekyll.sites.last.links[input]
         file.url
       else
         raise Glim::Error.new("path_to_url: No file found for: #{input}")
-      end unless input.nil?
+      end
     end
 
     def date_to_xmlschema(input)
@@ -104,17 +110,15 @@ module Glim
     end
 
     def group_by_exp(input, variable, expression)
-      if input.respond_to?(:group_by)
-        parsed_expr = Liquid::Variable.new(expression, Liquid::ParseContext.new)
-        @context.stack do
-          groups = input.group_by do |item|
-            @context[variable] = item
-            parsed_expr.render(@context)
-          end
-          groups.map { |key, value| { "name" => key, "items" => value, "size" => value.size } }
+      return input unless input.respond_to?(:group_by)
+      
+      parsed_expr = Liquid::Variable.new(expression, Liquid::ParseContext.new)
+      @context.stack do
+        groups = input.group_by do |item|
+          @context[variable] = item
+          parsed_expr.render(@context)
         end
-      else
-        input
+        groups.map { |key, value| { "name" => key, "items" => value, "size" => value.size } }
       end
     end
 
