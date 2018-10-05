@@ -185,7 +185,7 @@ module Glim
   module Filters
     class Liquid < Glim::Filter
       transforms 'liquid' => '*'
-      priority :higher
+      priority :lower
 
       def initialize(site)
         @site, @options = site, {
