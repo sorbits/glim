@@ -135,6 +135,8 @@ module Glim
       [ files, dirs ]
     end
 
+    private_class_method :items_in_directory
+
     def self.delete_items(files, dirs, keep: [])
       res = []
 
@@ -163,6 +165,8 @@ module Glim
       res
     end
 
+    private_class_method :delete_items
+
     def self.generate(output_dir, number_of_jobs, files, backtrace: false)
       Profiler.run("Creating pages") do
         if number_of_jobs == 1
@@ -172,6 +176,8 @@ module Glim
         end
       end
     end
+
+    private_class_method :generate
 
     def self.generate_async(output_dir, files, number_of_jobs, backtrace: false)
       total  = files.size
@@ -224,6 +230,8 @@ module Glim
       [ created, updated, warnings, errors ]
     end
 
+    private_class_method :generate_async
+
     def self.generate_subset(output_dir, files, backtrace: false)
       created, updated, warnings, errors = [], [], [], []
 
@@ -259,5 +267,7 @@ module Glim
 
       [ created, updated, warnings, errors ]
     end
+
+    private_class_method :generate_subset
   end
 end
