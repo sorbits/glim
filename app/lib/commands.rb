@@ -28,20 +28,20 @@ module Glim
 
       [ [ 'Created', created ], [ 'Deleted', deleted ], [ 'Updated', updated ] ].each do |label, files|
         unless files.empty?
-          STDERR.puts "==> #{label} #{files.count} #{files.count == 1 ? 'File' : 'Files'}"
+          STDERR.puts "==> #{label} #{files.size} #{files.size == 1 ? 'File' : 'Files'}"
           STDERR.puts files.map { |path| Util.relative_path(path, output_dir) }.sort.join(', ')
         end
       end
 
       unless warnings.empty?
-        STDERR.puts "==> #{warnings.count} #{warnings.count == 1 ? 'Warning' : 'Warnings'}"
+        STDERR.puts "==> #{warnings.size} #{warnings.size == 1 ? 'Warning' : 'Warnings'}"
         warnings.each do |message|
           STDERR.puts message
         end
       end
 
       unless errors.empty?
-        STDERR.puts "==> Stopped After #{errors.count} #{errors.count == 1 ? 'Error' : 'Errors'}"
+        STDERR.puts "==> Stopped After #{errors.size} #{errors.size == 1 ? 'Error' : 'Errors'}"
         errors.each do |arr|
           arr.each_with_index do |err, i|
             STDERR.puts err.gsub(/^/, '  '*i)
@@ -63,7 +63,7 @@ module Glim
         end
       else
         deleted = delete_items(files, dirs)
-        STDOUT.puts "Deleted #{deleted.count} #{deleted.count == 1 ? 'File' : 'Files'}."
+        STDOUT.puts "Deleted #{deleted.size} #{deleted.size == 1 ? 'File' : 'Files'}."
       end
     end
 

@@ -80,7 +80,7 @@ module WebSocket
                 running = false
                 break
               end
-              $log.debug("Send ‘#{message}’ to #{connections.count} WebSocket #{connections.count == 1 ? 'client' : 'clients'}") unless connections.empty?
+              $log.debug("Send ‘#{message}’ to #{connections.size} WebSocket #{connections.size == 1 ? 'client' : 'clients'}") unless connections.empty?
               connections.each do |conn|
                 begin
                   conn.puts(message)
